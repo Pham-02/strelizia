@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strelizia"
+version = "0.1.0"
+description = "Turn thousands of noisy server log lines into the few problems that actually matter."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["logs", "observability", "devops", "docker", "log-analysis"]
+dependencies = [
+    "drain3>=0.9.11",
+    "typer>=0.12",
+    "rich>=13",
+    "docker>=7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+strelizia = "strelizia.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
