@@ -11,6 +11,11 @@ runner = CliRunner()
 WIDE = {"COLUMNS": "200"}
 
 
+def flat(result) -> str:
+    """Output with all whitespace collapsed, so assertions do not depend on line wrapping."""
+    return " ".join(result.output.split())
+
+
 def ollama_env(fake):
     return {**WIDE, "OLLAMA_HOST": fake.host_port}
 
@@ -33,7 +38,7 @@ def test_demo_explain_with_ollama(fake_llm):
 def test_dry_run_sends_nothing_and_needs_no_model(fake_llm):
     r = runner.invoke(app, ["demo", "--dry-run"], env=ollama_env(fake_llm))
     assert r.exit_code == 0, r.output
-    assert "nothing was sent" in r.output
+    assert "nothing was sent" in flat(r)
     assert "User message" in r.output and "<IP_1>" in r.output
     assert "10.0.0.5" not in r.output.split("User message")[1]
     assert fake_llm.requests == []
@@ -74,7 +79,7 @@ def test_cloud_provider_prints_a_notice_before_sending(monkeypatch, fake_llm):
     monkeypatch.setattr("strelizia.llm.LLMConfig.is_local", property(lambda self: False))
     env = {**WIDE, "STRELIZIA_API_KEY": "k"}
     r = runner.invoke(app, ["demo", "--explain", "--provider", "openai", "--model", "m", "--base-url", fake_llm.url + "/v1"], env=env)
-    assert "redacted patterns" in r.output and "--dry-run" in r.output
+    assert "redacted patterns" in flat(r) and "--dry-run" in flat(r)
 
 
 def test_failure_still_prints_the_report_and_exits_nonzero(fake_llm):
@@ -83,17 +88,17 @@ def test_failure_still_prints_the_report_and_exits_nonzero(fake_llm):
     r = runner.invoke(app, ["demo", "--explain", "--provider", "openai", "--model", "m", "--base-url", fake_llm.url + "/v1"], env=env)
     assert r.exit_code == 1
     assert "ECONNREFUSED" in r.output  # the report is still there
-    assert "Could not get a diagnosis" in r.output and "rejected the key" in r.output
+    assert "Could not get a diagnosis" in flat(r) and "rejected the key" in flat(r)
 
 
 def test_missing_model_is_a_clear_error():
     r = runner.invoke(app, ["demo", "--explain"], env=WIDE)
-    assert r.exit_code == 1 and "No model chosen" in r.output and "ECONNREFUSED" in r.output
+    assert r.exit_code == 1 and "No model chosen" in flat(r) and "ECONNREFUSED" in r.output
 
 
 def test_ollama_not_running_is_a_clear_error():
     r = runner.invoke(app, ["demo", "--explain", "--model", "m"], env={**WIDE, "OLLAMA_HOST": "127.0.0.1:9"})
-    assert r.exit_code == 1 and "ollama serve" in r.output
+    assert r.exit_code == 1 and "ollama serve" in flat(r)
 
 
 def test_prompt_injection_in_logs_stays_inside_the_data_section(tmp_path, fake_llm):

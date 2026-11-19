@@ -47,6 +47,11 @@ class FakeLLM:
     host_port: str = ""
 
 
+class _QuietServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):  # clients that hang up early are expected
+        pass
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # keep test output quiet
         pass
@@ -81,7 +86,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def fake_llm():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    server = _QuietServer(("127.0.0.1", 0), _Handler)
     fake = FakeLLM()
     server.fake = fake
     port = server.server_address[1]

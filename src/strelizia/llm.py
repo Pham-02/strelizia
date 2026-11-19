@@ -142,7 +142,9 @@ def _post(cfg: LLMConfig, req: Request) -> dict:
         if isinstance(reason, TimeoutError) or "timed out" in str(reason):
             raise _timeout(cfg) from None
         hint = " Is Ollama running? Try `ollama serve`." if cfg.provider == "ollama" else ""
-        raise LLMError(f"Could not connect to {cfg.base_url} ({reason}).{hint}") from None
+        # Windows and Linux word this very differently and at great length; keep it short.
+        detail = "connection refused" if isinstance(reason, ConnectionRefusedError) else str(reason)
+        raise LLMError(f"Could not connect to {cfg.base_url} ({detail}).{hint}") from None
     except TimeoutError:
         raise _timeout(cfg) from None
     except (json.JSONDecodeError, UnicodeDecodeError):
