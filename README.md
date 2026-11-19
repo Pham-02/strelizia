@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/pham-02/strelizia/actions/workflows/ci.yml"><img src="https://github.com/pham-02/strelizia/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/status-v0.1%20early%20development-F97316" alt="Status: v0.1 early development">
+  <img src="https://img.shields.io/badge/status-v0.2%20early%20development-F97316" alt="Status: v0.2 early development">
   <img src="https://img.shields.io/badge/python-3.10%2B-5B3A9E" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-F59E0B" alt="License: MIT">
 </p>
@@ -47,10 +47,11 @@ Big observability platforms (Datadog, Elastic, Grafana Loki) solve this, but the
 1. **Assembles** multi-line entries, so a 30-line stack trace counts as one event
 2. **Groups** thousands of similar lines into a handful of distinct patterns
 3. **Ranks** them by severity and frequency, so the real problem is at the top
+4. **Explains** the top patterns in plain English, if you ask it to (`--explain`), using a local model or a cloud one, with secrets masked first
 
-Coming next: **diagnosis** of the top patterns in plain English, **detection of what changed** since your last deploy, and **alerts** on Telegram, Discord, Slack, or ntfy. See the [roadmap](#roadmap).
+Coming next: **detection of what changed** since your last deploy, and **alerts** on Telegram, Discord, Slack, or ntfy. See the [roadmap](#roadmap).
 
-> Grouping is done locally and deterministically. When LLM diagnosis arrives, the model will only be asked to explain the few top patterns, never to read your whole log. That keeps it fast, cheap, private, and more trustworthy.
+> Grouping is local and deterministic. Diagnosis is opt-in: the model only ever sees the few top patterns, redacted, never your whole log. That keeps it fast, cheap, private, and more trustworthy. And `--dry-run` shows you exactly what would be sent before anything is.
 
 ---
 
@@ -123,6 +124,31 @@ docker logs my-api 2>&1 | strelizia analyze -
 
 > `--docker` talks to the same Docker daemon that `docker logs` uses, so it works wherever that command works.
 
+### Add a plain-English diagnosis
+
+```bash
+# 1. Preview exactly what would be sent. Nothing is sent, and no model is needed.
+strelizia demo --dry-run
+
+# 2. A local model with Ollama: nothing leaves your machine at all
+ollama pull llama3.1
+strelizia analyze --docker my-api --explain --model llama3.1
+
+# 3. Or a cloud model. The key comes from an environment variable, never a flag.
+export ANTHROPIC_API_KEY=...        # PowerShell:  $env:ANTHROPIC_API_KEY = "..."
+strelizia analyze --docker my-api --explain --provider anthropic --model <model-name>
+```
+
+| Provider | Use it for | Key from |
+|---|---|---|
+| `ollama` (default) | Models running on your machine | none (`OLLAMA_HOST` if not on localhost) |
+| `openai` | OpenAI, and any OpenAI-compatible server (LM Studio, vLLM, OpenRouter, Groq...) via `--base-url` | `OPENAI_API_KEY` |
+| `anthropic` | Claude models | `ANTHROPIC_API_KEY` |
+
+You can also set `STRELIZIA_MODEL`, `STRELIZIA_BASE_URL`, and `STRELIZIA_API_KEY`. Bigger models give better diagnoses, and small local models sometimes struggle to return valid JSON (Strelizia retries once, then tells you).
+
+> The three providers are tested against local mock servers that follow each API's request and response format. Reports from real-world use are very welcome.
+
 ### Usage
 
 **`strelizia analyze [FILE]`**: group a log into its distinct problems
@@ -136,8 +162,12 @@ docker logs my-api 2>&1 | strelizia analyze -
 | `-l`, `--min-level warn` | Ignore records below this level (`debug`, `info`, `warn`, `error`, `fatal`) |
 | `--samples 2` | Sample log entries to show per pattern |
 | `--json` | Machine-readable JSON instead of the terminal report |
+| `--explain` | Ask a model to diagnose the top patterns |
+| `--dry-run` | Show exactly what `--explain` would send, without sending anything |
+| `--provider`, `--model`, `--base-url` | Which model to use (see above) |
+| `--explain-top 3` | How many top patterns to send for diagnosis (1 to 8) |
 
-**`strelizia demo`**: try it with generated logs
+**`strelizia demo`**: try it with generated logs. Takes the same `--explain`, `--dry-run`, `--provider`, `--model`, `--base-url`, `--explain-top`, `--top` and `--json` options.
 
 | Option | Meaning |
 |---|---|
@@ -157,8 +187,8 @@ docker logs my-api 2>&1 | strelizia analyze -
 | Severity detection and ranking | ✅ Available |
 | Terminal report and `--json` output | ✅ Available |
 | Demo log generator | ✅ Available |
-| Secret redaction and `--dry-run` | 🔜 v0.2 |
-| Plain-English diagnosis (Ollama or cloud models) | 🔜 v0.2 |
+| Secret redaction and `--dry-run` | ✅ Available |
+| Plain-English diagnosis (Ollama, OpenAI-compatible, Anthropic) | ✅ Available |
 | "What changed" detection: new errors and spikes | 🔜 v0.3 |
 | Watch mode and alerts (Telegram, Discord, Slack, ntfy) | 🔜 v0.3 |
 | Dedicated nginx, syslog, and journald adapters | 🔜 v0.4 |
@@ -171,27 +201,40 @@ Uses log template mining (the Drain algorithm via [`drain3`](https://github.com/
 
 One failure is often 10 to 50 lines. Strelizia glues stack-trace lines back together and builds each pattern from what identifies the problem: the exception and where it happened. Thousands of traces from one bug become one pattern, while different bugs stay separate.
 
+### 🔒 Redaction built in
+
+Before anything is sent to a model, Strelizia masks values with stable placeholders (`<IP_1>`, `<EMAIL_1>`, `<TOKEN_2>`), so a model can still see that "the same host failed 400 times" without seeing the host. It handles IPv4 and IPv6 addresses, emails, JWTs and common API key formats (AWS, GitHub, Slack, Stripe, Google, OpenAI-style), bearer tokens, `password=` style values, credentials inside URLs, private key blocks, usernames in home-directory paths, and long random-looking tokens.
+
+### 🧠 Plain-English diagnosis
+
+With `--explain`, the top patterns go to a model along with useful context: counts, first and last seen times, a few samples, the records just before each pattern first appeared, and for Docker containers facts like the restart count and whether it was killed for running out of memory. The model must answer in a fixed structure: an overall diagnosis (patterns are often symptoms of one cause), and for each pattern a summary, a likely cause (a hypothesis, not a fact), a confidence level, evidence from the logs, and read-only commands to verify it.
+
+Strelizia **never executes anything**, and it hides suggested commands that could change things (restarts, deletes, installs, redirects).
+
+*Hand-written illustration of the output format (not captured from a real model):*
+
+```text
+Overall diagnosis: The database is unreachable, so every request fails.
+
+#1 ERROR  882×   ERROR connect ECONNREFUSED <IP>
+Diagnosis  The app cannot connect to its database.
+Cause      The database server is down or refusing connections.  (confidence: high)
+Evidence   • ECONNREFUSED <IP_1>:5432
+Check      $ docker ps -a
+           $ docker logs --tail 50 db 2>&1
+```
+
+### 🏠 Local-first, bring your own model
+
+Run fully offline with [Ollama](https://ollama.com), or use any OpenAI-compatible server or Anthropic. Strelizia also works without any model at all, in grouping-only mode. Model calls use only Python's standard library, so installing stays light.
+
 ### 🪶 Lightweight by design
 
-Streaming processing with bounded memory. Current numbers (v0.1, synthetic logs on a small cloud VM, so treat them as a rough guide): about **50,000 lines per second** with **under 40 MB** of memory, collapsing roughly 180,000 records into 4 patterns.
+Streaming processing, bounded memory, and a cache that skips the clustering work for repeated identical lines. Current numbers (synthetic logs on a small cloud VM, so treat them as a rough guide): about **30,000 lines per second** on varied logs like nginx access logs, and **250,000+** on repetitive ones like an error flood, using tens of MB of memory.
 
 ### 🔍 What changed *(planned, v0.3)*
 
 A local baseline will flag patterns that are **new** (first seen after the last restart or deploy), **spiking** (far above their normal rate), or **persistent**, so alerts read "New error since the 14:02 deploy" instead of a generic summary.
-
-### 🧠 Plain-English diagnosis *(planned, v0.2)*
-
-The top patterns will be sent to an LLM with useful context, and it must answer in a fixed structure: a summary, a likely cause (a hypothesis, not a fact), a confidence level, the log lines it based that on, and read-only commands to verify it. Strelizia will **never execute anything automatically.**
-
-*Mock-up of the planned output (not implemented yet):*
-
-```text
-Diagnosis: The app cannot reach its database. Errors began right after the
-container restarted, and the DB container shows 0 uptime, so it is likely
-down or crash-looping.                                      Confidence: high
-Check next:  docker ps -a | grep postgres
-             docker logs --tail 50 postgres
-```
 
 ### 🔔 Alerts where you already are *(planned, v0.3)*
 
@@ -213,10 +256,15 @@ Telegram, Discord, Slack, ntfy, and email through [Apprise](https://github.com/c
         ▼
  Ranker                   severity, then frequency                         ✅
         │
+        ├──────────────► Terminal report / JSON                            ✅
+        │
+        ▼  only with --explain
+ Redactor                 masks IPs, emails, tokens, secrets               ✅
+        │
         ▼
- Terminal report / JSON                                                    ✅
+ LLM explainer            top patterns only, read-only suggestions         ✅
 
- Coming:  Redactor → Baseline and spike detection → LLM explainer → Alerts
+ Coming:  Baseline and spike detection → Alerts
 ```
 
 ---
@@ -237,9 +285,14 @@ Telegram, Discord, Slack, ntfy, and email through [Apprise](https://github.com/c
 
 Server logs are sensitive, so Strelizia is built to be conservative:
 
-- **v0.1 runs entirely on your machine.** Nothing is sent anywhere: no telemetry, no accounts, no network calls other than talking to your local Docker daemon.
-- When LLM diagnosis arrives (v0.2), a **redaction layer** will mask IPs, emails, tokens, and keys first, only pattern templates and a few redacted samples will be sent, and `--dry-run` will show the exact payload before you trust it.
-- With a local model through [Ollama](https://ollama.com), nothing will need to leave your machine at all.
+- **Without `--explain`, everything runs on your machine.** Nothing is sent anywhere: no telemetry, no accounts, no network calls other than talking to your local Docker daemon.
+- **With `--explain`, only a small slice is sent:** the top patterns (3 by default), each with its template, at most 2 clipped samples, and at most 2 records from just before it appeared, plus container facts. **Never your whole log.**
+- **It is all redacted first** (see [Redaction](#-redaction-built-in)), and `--dry-run` prints the exact payload so you can check it before trusting it.
+- **With a local model through [Ollama](https://ollama.com), nothing leaves your machine.** With a cloud provider, Strelizia prints a notice naming the host before it sends.
+- **API keys come from environment variables only.** They are never accepted as flags (which end up in shell history), never printed, and never stored.
+- **Logs are treated as untrusted.** Log text can contain attacker-controlled content, so it is fenced off, the model is told never to follow instructions found in it, the answer is validated strictly, and risky commands are hidden.
+
+Redaction is pattern based, so it cannot catch everything. It will not recognise a bare person's name, an internal hostname, or a secret written in free text. Review the `--dry-run` output when you first set it up, especially for custom log formats.
 
 ---
 
@@ -248,7 +301,8 @@ Server logs are sensitive, so Strelizia is built to be conservative:
 Strelizia is honest about what it is:
 
 - Pattern grouping is a heuristic. Unusual log formats may split one problem into a few patterns or merge similar ones.
-- Planned diagnoses will be **hypotheses**. The real cause of a failure often lives outside the logs (config, a deploy, a full disk), so always check the evidence it shows.
+- Diagnoses are **hypotheses**. The real cause of a failure often lives outside the logs (config, a deploy, a full disk), so always check the evidence it shows. Smaller models are noticeably less reliable.
+- Redaction cannot catch every secret (see [Privacy](#privacy)).
 - It does not store or index your logs. It is an analyzer, not a log management system.
 
 **Non-goals:** a web dashboard, long-term log storage or full-text search, automatic remediation, and replacing Datadog or Elastic at scale.
@@ -258,18 +312,18 @@ Strelizia is honest about what it is:
 ## Roadmap
 
 - [x] **v0.1**: Docker, file and stdin sources, multi-line assembly, Drain3 grouping, `analyze` and `demo` commands
-- [ ] **v0.2**: redaction layer, LLM explainer with structured output, Ollama support, `--dry-run`
+- [x] **v0.2**: redaction layer, `--dry-run`, LLM diagnosis with structured output (Ollama, OpenAI-compatible, Anthropic), Docker container facts
 - [ ] **v0.3**: watch mode, local baseline, new and spike detection, cooldowns, Apprise alerts
 - [ ] **v0.4**: nginx, syslog and journald adapters, daily digest, Docker Compose setup, benchmarks
-- [ ] **Later**: custom rules file, feedback (👍/👎) to improve diagnoses, Kubernetes support
+- [ ] **Later**: publish to PyPI, custom rules file, feedback (👍/👎) to improve diagnoses, Kubernetes support
 
 ---
 
 ## Tech stack
 
-Python · [Drain3](https://github.com/logpai/Drain3) · Docker SDK · [Typer](https://typer.tiangolo.com) + [Rich](https://github.com/Textualize/rich) · pytest
+Python · [Drain3](https://github.com/logpai/Drain3) · Docker SDK · [Typer](https://typer.tiangolo.com) + [Rich](https://github.com/Textualize/rich) · pytest. Model calls use the standard library only.
 
-Planned: SQLite · [Apprise](https://github.com/caronc/apprise) · [LiteLLM](https://github.com/BerriAI/litellm) · Pydantic
+Planned: SQLite · [Apprise](https://github.com/caronc/apprise)
 
 ---
 
@@ -285,7 +339,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Project layout: `assembler.py` (multi-line records), `clusterer.py` (Drain3 grouping), `sources/` (Docker and file readers), `report.py` (terminal output), `demo.py` (log generator).
+Project layout: `assembler.py` (multi-line records), `clusterer.py` (Drain3 grouping), `sources/` (Docker and file readers), `redact.py` (secret masking), `llm.py` (model providers), `explain.py` (payload, parsing, command safety), `report.py` (terminal output), `demo.py` (log generator).
 
 ---
 

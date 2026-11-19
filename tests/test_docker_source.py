@@ -55,3 +55,22 @@ def test_daemon_down_is_friendly(monkeypatch):
     monkeypatch.setattr(docker, "from_env", boom)
     with pytest.raises(SourceError, match="Docker daemon"):
         list(read_container("api"))
+
+
+def test_inspect_container_facts(monkeypatch):
+    from strelizia.sources.docker import inspect_container
+
+    class C:
+        attrs = {
+            "Name": "/api",
+            "RestartCount": 7,
+            "Config": {"Image": "corp/api:2.4.1"},
+            "State": {"Status": "running", "OOMKilled": True, "ExitCode": 137,
+                      "StartedAt": "2026-11-18T10:00:00Z", "FinishedAt": "0001-01-01T00:00:00Z"},
+        }
+
+    monkeypatch.setattr(docker, "from_env", lambda: FakeClient(C()))
+    info = inspect_container("api")
+    assert (info.name, info.restart_count, info.oom_killed, info.finished_at) == ("api", 7, True, "")
+    facts = "\n".join(info.facts())
+    assert "restart count: 7" in facts and "running out of memory: yes" in facts and "exit code: 137" in facts

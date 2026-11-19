@@ -10,7 +10,7 @@ merged into a 502 (ERROR) just because the lines look alike.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterable, Optional
 
 from drain3 import TemplateMiner
 from drain3.masking import MaskingInstruction
@@ -53,6 +53,10 @@ class Clusterer:
         self._miners: dict[str, TemplateMiner] = {}  # one Drain tree per level
         self._clusters: dict[tuple[str, int], Cluster] = {}
         self._next_id = 1
+        # Exact-duplicate cache: an identical line always lands in the same cluster, so we
+        # can skip masking and tree search. Capped so unique-heavy logs cannot grow it forever.
+        self._seen: dict[tuple[str, str], Cluster] = {}
+        self._seen_cap = 20_000
 
     def _miner_for(self, level: str) -> TemplateMiner:
         miner = self._miners.get(level)
@@ -61,19 +65,27 @@ class Clusterer:
             self._miners[level] = miner
         return miner
 
-    def add(self, record: LogRecord) -> Optional[int]:
+    def add(self, record: LogRecord, context: Optional[Iterable[str]] = None) -> Optional[int]:
         sig = record.signature
         if not sig:
             return None
         level = record.level
+        cached = self._seen.get((level, sig))
+        if cached is not None:
+            cached.observe(record, self._max_samples)
+            return cached.id
         result = self._miner_for(level).add_log_message(sig)
         key = (level, result["cluster_id"])
         cluster = self._clusters.get(key)
         if cluster is None:
             cluster = Cluster(id=self._next_id, template=result["template_mined"], level=level)
+            if context:
+                cluster.context_before = [c[:600] for c in context]
             self._next_id += 1
             self._clusters[key] = cluster
         cluster.observe(record, self._max_samples)
+        if len(self._seen) < self._seen_cap:
+            self._seen[(level, sig)] = cluster
         return cluster.id
 
     def clusters(self) -> list[Cluster]:

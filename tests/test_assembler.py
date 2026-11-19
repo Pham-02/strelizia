@@ -21,7 +21,7 @@ def test_python_traceback_is_one_record():
     first = recs[0]
     assert first.line_count == 5
     assert first.level == "ERROR"
-    assert first.timestamp == datetime(2026, 11, 18, 14, 2, 11)
+    assert first.resolve_timestamp() == datetime(2026, 11, 18, 14, 2, 11)
     assert not first.message.startswith("2026")  # timestamp stripped
     assert "ValueError: bad input" in first.signature
     assert "handler" in first.signature

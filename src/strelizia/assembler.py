@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Iterable, Iterator, Optional, Union
 
 from .models import LogRecord, RawLine
+from .util import parse_timestamp  # noqa: F401  (re-exported)
 
 # A line that starts with a timestamp begins a new record.
 TS_PREFIX = re.compile(
@@ -84,30 +85,17 @@ def detect_level(message: str) -> str:
     return "INFO"
 
 
-def parse_timestamp(text: str) -> Optional[datetime]:
-    """Parse the timestamp styles we strip from line prefixes. Returns None on failure."""
-    s = text.strip().replace(",", ".")
-    s = re.sub(r"^(\d{4})/(\d{2})/(\d{2})", r"\1-\2-\3", s)
-    s = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), s)
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s)
-    try:
-        return datetime.fromisoformat(s)
-    except ValueError:
-        return None
-
-
 def _starts_record(text: str) -> bool:
     return bool(TS_PREFIX.match(text) or SYSLOG_PREFIX.match(text))
 
 
 def _build(lines: list[str], raw_ts: Optional[datetime], source: str) -> LogRecord:
     first = lines[0]
-    ts = raw_ts
+    ts_text = None
     m = TS_PREFIX.match(first)
     if m:
-        ts = ts or parse_timestamp(m.group("ts"))
+        if raw_ts is None:
+            ts_text = m.group("ts")  # parsed lazily, only if the record is kept
         first = first[m.end():]
     else:
         m = SYSLOG_PREFIX.match(first)
@@ -116,10 +104,11 @@ def _build(lines: list[str], raw_ts: Optional[datetime], source: str) -> LogReco
     message = "\n".join([first, *lines[1:]])
     return LogRecord(
         message=message,
-        timestamp=ts,
+        timestamp=raw_ts,
         level=detect_level(message),
         source=source,
         line_count=len(lines),
+        ts_text=ts_text,
     )
 
 

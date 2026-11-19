@@ -8,6 +8,8 @@ from rich.console import Console, Group
 from rich.panel import Panel
 from rich.text import Text
 
+from .explain import Explanation, Payload
+from .llm import LLMConfig, Request
 from .models import Cluster
 from .pipeline import Stats
 
@@ -40,7 +42,14 @@ def _clip(sample: str, max_lines: int = 8, max_width: int = 160) -> str:
     return "\n".join(shown)
 
 
-def render_report(console: Console, clusters: list[Cluster], stats: Stats, top: int, source: str) -> None:
+def render_report(
+    console: Console,
+    clusters: list[Cluster],
+    stats: Stats,
+    top: int,
+    source: str,
+    explanation: Optional[Explanation] = None,
+) -> None:
     shown = clusters[:top]
 
     header = Text()
@@ -58,6 +67,18 @@ def render_report(console: Console, clusters: list[Cluster], stats: Stats, top: 
     if not shown:
         console.print(Text("No warnings or errors found. Nothing to worry about. 🌺", style="green"))
         return
+
+    if explanation and explanation.overall:
+        console.print(
+            Panel(
+                Text(explanation.overall),
+                title=Text("🧠 Overall diagnosis", style="bold magenta"),
+                title_align="left",
+                subtitle=Text(f"{explanation.provider} · {explanation.model} · a hypothesis, not a fact", style="dim"),
+                subtitle_align="right",
+                border_style="magenta",
+            )
+        )
 
     for rank, cluster in enumerate(shown, start=1):
         icon, text_style, border = _STYLE.get(cluster.level, _STYLE["INFO"])
@@ -85,6 +106,10 @@ def render_report(console: Console, clusters: list[Cluster], stats: Stats, top: 
             body.append(label)
             body.append(Text(_clip(sample), style="dim"))
 
+        diag = explanation.patterns.get(rank) if explanation else None
+        if diag:
+            body.extend(_diagnosis_lines(diag))
+
         console.print(Panel(Group(*body), title=title, title_align="left", border_style=border))
 
     hidden = len(clusters) - len(shown)
@@ -92,7 +117,71 @@ def render_report(console: Console, clusters: list[Cluster], stats: Stats, top: 
         console.print(Text(f"… and {hidden:,} more patterns. Use --top to show more.", style="dim"))
 
 
-def clusters_to_json(clusters: list[Cluster], stats: Stats, top: int) -> dict:
+def _diagnosis_lines(diag) -> list[Text]:
+    lines: list[Text] = []
+    head = Text("\n")
+    head.append("Diagnosis  ", style="bold magenta")
+    head.append(diag.summary)
+    lines.append(head)
+    cause = Text()
+    cause.append("Cause      ", style="bold magenta")
+    cause.append(diag.likely_cause)
+    cause.append(f"  (confidence: {diag.confidence})", style="dim")
+    lines.append(cause)
+    for i, item in enumerate(diag.evidence):
+        ev = Text()
+        ev.append("Evidence   " if i == 0 else "           ", style="bold magenta")
+        ev.append("• " + item, style="dim")
+        lines.append(ev)
+    for i, cmd in enumerate(diag.things_to_check):
+        chk = Text()
+        chk.append("Check      " if i == 0 else "           ", style="bold magenta")
+        chk.append("$ " + cmd, style="green")
+        lines.append(chk)
+    if diag.hidden_commands:
+        n = diag.hidden_commands
+        lines.append(Text(f"           ({n} suggested command{'s' if n != 1 else ''} hidden: could change things)", style="dim"))
+    return lines
+
+
+def render_dry_run(console: Console, cfg: LLMConfig, req: Request, payload: Payload) -> None:
+    """Show exactly what a real --explain call would send. Nothing is sent."""
+    info = Text()
+    info.append("Dry run: nothing was sent.\n", style="bold green")
+    where = "on this machine" if cfg.is_local else "over the internet"
+    info.append("Provider   ", style="bold")
+    info.append(f"{cfg.provider} ({where})\n")
+    info.append("Endpoint   ", style="bold")
+    info.append(f"{req.url}\n")
+    info.append("Model      ", style="bold")
+    info.append(f"{cfg.model}\n")
+    info.append("Redacted   ", style="bold")
+    info.append(f"{payload.redaction}\n")
+    info.append("Size       ", style="bold")
+    info.append(f"{len(payload.user):,} characters of log data, {payload.pattern_count} patterns\n")
+    if cfg.provider != "ollama" and cfg.api_key is not None:
+        info.append("API key    ", style="bold")
+        info.append("read from the environment, never shown or stored", style="dim")
+    console.print(Panel(info, border_style="green", title="Strelizia --dry-run", title_align="left"))
+    console.print(Panel(Text(payload.system), title="System message", title_align="left", border_style="dim"))
+    console.print(Panel(Text(payload.user), title="User message (all the log data the model would see)", title_align="left", border_style="dim"))
+
+
+def clusters_to_json(
+    clusters: list[Cluster], stats: Stats, top: int, explanation: Optional[Explanation] = None
+) -> dict:
+    def diagnosis(rank: int):
+        diag = explanation.patterns.get(rank) if explanation else None
+        if not diag:
+            return None
+        return {
+            "summary": diag.summary,
+            "likely_cause": diag.likely_cause,
+            "confidence": diag.confidence,
+            "evidence": diag.evidence,
+            "things_to_check": diag.things_to_check,
+        }
+
     return {
         "stats": {
             "lines": stats.lines,
@@ -100,6 +189,7 @@ def clusters_to_json(clusters: list[Cluster], stats: Stats, top: int) -> dict:
             "skipped": stats.skipped,
             "clusters": stats.clusters,
         },
+        "overall_diagnosis": explanation.overall if explanation else None,
         "clusters": [
             {
                 "id": c.id,
@@ -109,7 +199,8 @@ def clusters_to_json(clusters: list[Cluster], stats: Stats, top: int) -> dict:
                 "first_seen": c.first_seen.isoformat() if c.first_seen else None,
                 "last_seen": c.last_seen.isoformat() if c.last_seen else None,
                 "samples": c.samples,
+                "diagnosis": diagnosis(rank),
             }
-            for c in clusters[:top]
+            for rank, c in enumerate(clusters[:top], start=1)
         ],
     }

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional
 
+from .util import parse_timestamp
+
 LEVELS = ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
 LEVEL_RANK = {name: i + 1 for i, name in enumerate(LEVELS)}
 
@@ -40,6 +42,14 @@ class LogRecord:
     level: str = "INFO"
     source: str = ""
     line_count: int = 1
+    ts_text: Optional[str] = field(default=None, repr=False)  # unparsed; see resolve_timestamp
+
+    def resolve_timestamp(self) -> Optional[datetime]:
+        """Parse the timestamp on first use. Most records are filtered out, so this saves work."""
+        if self.timestamp is None and self.ts_text is not None:
+            self.timestamp = parse_timestamp(self.ts_text)
+            self.ts_text = None
+        return self.timestamp
 
     @property
     def signature(self) -> str:
@@ -98,16 +108,20 @@ class Cluster:
     first_seen: Optional[datetime] = None
     last_seen: Optional[datetime] = None
     samples: list[str] = field(default_factory=list)
+    context_before: list[str] = field(default_factory=list)  # records just before it first appeared
+    _first_key: Optional[datetime] = field(default=None, repr=False, compare=False)
+    _last_key: Optional[datetime] = field(default=None, repr=False, compare=False)
 
     def observe(self, record: LogRecord, max_samples: int) -> None:
         self.count += 1
         if level_rank(record.level) > level_rank(self.level):
             self.level = record.level
-        ts = record.timestamp
+        ts = record.resolve_timestamp()
         if ts is not None:
-            if self.first_seen is None or as_utc(ts) < as_utc(self.first_seen):
-                self.first_seen = ts
-            if self.last_seen is None or as_utc(ts) > as_utc(self.last_seen):
-                self.last_seen = ts
+            key = as_utc(ts)  # converted once, compared against cached keys
+            if self._first_key is None or key < self._first_key:
+                self._first_key, self.first_seen = key, ts
+            if self._last_key is None or key > self._last_key:
+                self._last_key, self.last_seen = key, ts
         if len(self.samples) < max_samples and record.message not in self.samples:
             self.samples.append(record.message[:1500])

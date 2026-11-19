@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Iterable, Union
 
@@ -34,12 +35,14 @@ def analyze_lines(
 
     threshold = level_rank(min_level)
     clusterer = Clusterer(max_samples=max_samples)
+    recent: deque[str] = deque(maxlen=2)  # the records just before the current one
     for record in assemble(counted(), source=source):
         stats.records += 1
-        if level_rank(record.level) < threshold:
+        if level_rank(record.level) >= threshold:
+            clusterer.add(record, recent)
+        else:
             stats.skipped += 1
-            continue
-        clusterer.add(record)
+        recent.append(record.message)
 
     clusters = clusterer.clusters()
     stats.clusters = len(clusters)
