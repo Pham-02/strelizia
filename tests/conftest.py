@@ -97,3 +97,40 @@ def fake_llm():
     yield fake
     server.shutdown()
     server.server_close()
+
+
+@dataclass
+class FakeHook:
+    url: str = ""
+    requests: list = field(default_factory=list)
+    status: int = 200
+
+
+class _HookHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        hook: FakeHook = self.server.hook
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = raw.decode("utf-8")
+        hook.requests.append(Recorded(self.path, {k.lower(): v for k, v in self.headers.items()}, body))
+        self.send_response(hook.status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+@pytest.fixture
+def fake_hook():
+    server = _QuietServer(("127.0.0.1", 0), _HookHandler)
+    hook = FakeHook()
+    server.hook = hook
+    hook.url = f"http://127.0.0.1:{server.server_address[1]}"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield hook
+    server.shutdown()
+    server.server_close()

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from rich.console import Console, Group
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 from .explain import Explanation, Payload
@@ -204,3 +206,73 @@ def clusters_to_json(
             for rank, c in enumerate(clusters[:top], start=1)
         ],
     }
+
+
+_STATUS_STYLE = {"sent": "green", "console": "dim", "preview": "yellow", "held": "yellow", "dropped": "dim"}
+
+
+def render_watch_header(console: Console, sources: list[str], interval: str, destinations: str, extras: list[str]) -> None:
+    info = Text()
+    info.append("Strelizia watch\n", style="bold magenta")
+    info.append("Watching   ", style="bold")
+    info.append(", ".join(sources) + "\n")
+    info.append("Window     ", style="bold")
+    info.append(f"{interval}\n")
+    info.append("Alerts to  ", style="bold")
+    info.append(destinations)
+    for line in extras:
+        info.append("\n" + line, style="dim")
+    info.append("\nPress Ctrl+C to stop.", style="dim")
+    console.print(Panel(info, border_style="magenta"))
+
+
+def render_window(console: Console, result, *, quiet: bool = False) -> None:
+    """One line per window, and a panel whenever something deserves attention."""
+    stamp = datetime.now().strftime("%H:%M:%S")
+    interesting = bool(result.alerts or result.errors or result.notes or result.delayed)
+    if not quiet:
+        line = Text()
+        line.append(f"{stamp}  ", style="dim")
+        line.append(result.source, style="bold")
+        n = result.patterns
+        line.append(f"  {result.records:,} records · {n} pattern{'s' if n != 1 else ''}", style="dim")
+        console.print(line)
+    elif not interesting:
+        return
+
+    if result.alerts and result.message:
+        worst = result.message.level
+        border = "red" if worst in ("ERROR", "FATAL") else "yellow"
+        console.print(Panel(Text(result.message.text), title=Text(result.message.title, style="bold"), title_align="left", border_style=border))
+        if result.status == "sent":
+            console.print(Text("  → sent to " + ", ".join(result.delivered_to), style="green"))
+        elif result.status == "preview":
+            console.print(Text("  → dry run: not sent anywhere", style="yellow"))
+        elif result.status == "failed":
+            console.print(Text("  → delivery failed, will retry next window", style="red"))
+        else:
+            console.print(Text("  → shown here only (no --notify destination set)", style="dim"))
+    elif result.alerts and result.status == "held":
+        n = len(result.alerts)
+        console.print(Text(f"  ⏸ {n} alert{'s' if n != 1 else ''} held until quiet hours end", style="yellow"))
+
+    if result.delayed:
+        console.print(Text(f"  ↪ sent a digest of earlier alerts: {result.delayed.title}", style="green"))
+    for err in result.errors:
+        console.print(Text(f"  ! {err}", style="red"))
+    for note in result.notes:
+        console.print(Text(f"  ! {note}", style="yellow"))
+
+
+def render_history(console: Console, alerts) -> None:
+    if not alerts:
+        console.print(Text("No alerts yet.", style="dim"))
+        return
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    for col in ("When", "Source", "Kind", "Level", "Count", "Status", "Sent to"):
+        table.add_column(col)
+    for a in alerts:
+        when = datetime.fromtimestamp(a.ts).strftime("%Y-%m-%d %H:%M:%S")
+        table.add_row(when, Text(a.source), a.kind, a.level, f"{a.count:,}",
+                      Text(a.status, style=_STATUS_STYLE.get(a.status, "")), Text(a.targets or "-"))
+    console.print(table)

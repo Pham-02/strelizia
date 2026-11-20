@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import random
+import threading
 from datetime import datetime, timedelta
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 _TS = "%Y-%m-%d %H:%M:%S"
 
@@ -112,3 +113,38 @@ def generate(scenario: str, seed: int = 7, now: Optional[datetime] = None) -> li
     rng = random.Random(seed)
     start = (now or datetime.now()).replace(microsecond=0) - timedelta(minutes=15)
     return SCENARIOS[scenario](rng, start)
+
+
+# ---------------------------------------------------------------------- live stream for `watch --demo`
+
+STREAMS = ("spike",)
+
+
+def _spike_window(rng: random.Random, burst: bool) -> list[str]:
+    """One window of a payment service: quiet normally, then a burst plus a brand-new error."""
+    now = datetime.now().strftime(_TS)
+    lines = [f"{now} INFO request GET /api/orders/{rng.randint(1, 9999)} 200 {rng.randint(5, 90)}ms" for _ in range(18 if not burst else 20)]
+    errors = 90 if burst else 2
+    lines += [f"{now} ERROR payment gateway timeout after {rng.randint(2000, 9000)}ms (order {rng.randint(1000, 9999)})" for _ in range(errors)]
+    if burst:
+        lines += [f"{now} ERROR disk quota exceeded for tenant {rng.randint(1, 40)}" for _ in range(6)]
+    rng.shuffle(lines)
+    return lines
+
+
+def stream_lines(scenario: str, interval: float, stop: threading.Event) -> Iterator[str]:
+    """Yield log lines paced in real time: 8 quiet windows, 2 burst windows, then quiet again."""
+    if scenario not in STREAMS:
+        raise ValueError(f"Unknown demo {scenario!r}. Choose from: {', '.join(STREAMS)}")
+    rng = random.Random(7)
+    for burst in [False] * 8 + [True] * 2 + [False] * 3:
+        lines = _spike_window(rng, burst)
+        gap = interval / max(len(lines), 1)
+        for line in lines:
+            if stop.is_set():
+                return
+            yield line
+            stop.wait(gap)
+    while not stop.is_set():  # keep the service quietly alive until the user stops the demo
+        yield f"{datetime.now().strftime(_TS)} INFO request GET /health 200 2ms"
+        stop.wait(interval)

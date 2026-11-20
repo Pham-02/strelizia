@@ -2,6 +2,7 @@
 
 import json
 import sys
+from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
@@ -11,13 +12,17 @@ from . import __version__
 from .demo import SCENARIOS, generate
 from .explain import ExplainError, Explanation, build_payload, explain as run_explain
 from .llm import PROVIDERS, LLMError, build_request, resolve_config
+from .follow import Source, Watcher, follow_demo, follow_docker, follow_file
 from .models import LEVELS
+from .notify import parse_targets
 from .pipeline import analyze_lines
-from .report import clusters_to_json, render_dry_run, render_report
+from .report import clusters_to_json, render_dry_run, render_history, render_report, render_watch_header, render_window
 from .sources import SourceError
 from .sources.docker import inspect_container, read_container
 from .sources.file import read_file
-from .util import parse_duration
+from .store import Store, default_state_path
+from .util import parse_duration, parse_quiet_hours
+from .watch import Engine, WatchConfig
 
 app = typer.Typer(
     help="Strelizia: turn thousands of noisy log lines into the few problems that matter.",
@@ -180,6 +185,140 @@ def demo(
         clusters, stats, top=top, source=source, as_json=as_json, explain=explain, dry_run=dry_run,
         provider=provider, model=model, base_url=base_url, explain_top=explain_top,
     )
+
+
+@app.command()
+def watch(
+    files: Annotated[Optional[list[str]], typer.Argument(help="Log file(s) to follow.")] = None,
+    docker: Annotated[Optional[list[str]], typer.Option("--docker", "-d", help="Docker container to follow (repeat for several).")] = None,
+    demo_stream: Annotated[Optional[str], typer.Option("--demo", help="Watch a simulated live log, no server needed. Try: spike")] = None,
+    interval: Annotated[str, typer.Option("--interval", help="Length of each window (e.g. 30s, 1m).")] = "60s",
+    notify: Annotated[Optional[list[str]], typer.Option("--notify", help="Where to send alerts (repeatable). Or set STRELIZIA_NOTIFY.")] = None,
+    alert_level: Annotated[str, typer.Option("--alert-level", help="Lowest level that can raise an alert.")] = "error",
+    cooldown: Annotated[str, typer.Option("--cooldown", help="Minimum time between repeat alerts for one pattern.")] = "2h",
+    spike_factor: Annotated[float, typer.Option("--spike-factor", min=1.5, help="A spike is this many times the usual rate.")] = 5.0,
+    min_count: Annotated[int, typer.Option("--min-count", min=1, help="Occurrences needed in a window to count as a spike.")] = 5,
+    min_history: Annotated[Optional[str], typer.Option("--min-history", help="How long to watch before judging spikes (default 10m).")] = None,
+    quiet_hours: Annotated[Optional[str], typer.Option("--quiet-hours", help="Hold alerts during these hours, e.g. 23:00-07:00.")] = None,
+    state: Annotated[Optional[str], typer.Option("--state", help="Where Strelizia keeps its memory (default ~/.strelizia/state.db).")] = None,
+    from_start: Annotated[bool, typer.Option("--from-start", help="Files: read existing content too, not just new lines.")] = False,
+    alert_samples: Annotated[bool, typer.Option("--alert-samples", help="Include one redacted sample line in alerts.")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Show alerts here but send them nowhere.")] = False,
+    quiet: Annotated[bool, typer.Option("--quiet", help="Only print when something happens.")] = False,
+    duration: Annotated[Optional[str], typer.Option("--duration", help="Stop after this long, e.g. 5m.")] = None,
+    explain: Annotated[bool, typer.Option("--explain", help="Add a model's diagnosis to alerts.")] = False,
+    provider: ProviderOpt = "ollama",
+    model: ModelOpt = None,
+    base_url: BaseUrlOpt = None,
+    explain_top: ExplainTopOpt = 3,
+) -> None:
+    """Follow live logs and alert on what is new or unusual."""
+    if not (files or docker or demo_stream):
+        err_console.print("[red]Nothing to watch.[/red] Give a log file, --docker NAME, or try --demo spike.")
+        raise typer.Exit(2)
+
+    try:
+        window = parse_duration(interval)
+        cooldown_s = parse_duration(cooldown)
+        history_s = parse_duration(min_history) if min_history else (window * 5 if demo_stream else 600)
+        stop_after = parse_duration(duration) if duration else None
+        quiet_window = parse_quiet_hours(quiet_hours) if quiet_hours else None
+        notifiers = parse_targets(notify or [])
+        if window <= 0:
+            raise ValueError("--interval must be greater than zero.")
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2)
+
+    cfg = WatchConfig(
+        interval=window, alert_level=_normalise_level(alert_level), cooldown=cooldown_s,
+        spike_factor=spike_factor, min_count=min_count, min_history=history_s,
+        quiet_hours=quiet_window, include_samples=alert_samples,
+    )
+
+    errors_seen: list[str] = []
+
+    def on_error(message: str) -> None:
+        errors_seen.append(message)
+        err_console.print(f"[yellow]! {message}[/yellow]")
+
+    sources: list[Source] = []
+    try:
+        for name in docker or []:
+            inspect_container(name)  # fail fast on a typo instead of waiting silently
+            sources.append(Source(name, lambda put, stop, n=name: follow_docker(n, put, stop, report=on_error), container=name))
+    except SourceError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    for path in files or []:
+        if not Path(path).exists():
+            err_console.print(f"[yellow]{path} does not exist yet. Waiting for it to appear.[/yellow]")
+        sources.append(Source(path, lambda put, stop, p=path: follow_file(p, put, stop, from_start=from_start)))
+    if demo_stream:
+        try:
+            from .demo import STREAMS
+            if demo_stream not in STREAMS:
+                raise ValueError(f"Unknown demo {demo_stream!r}. Choose from: {', '.join(STREAMS)}")
+        except ValueError as exc:
+            err_console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(2)
+        sources.append(Source(f"demo: {demo_stream}", lambda put, stop: follow_demo(demo_stream, window, put, stop)))
+
+    explainer = None
+    if explain:
+        try:
+            llm_cfg = resolve_config(provider, model, base_url)
+        except LLMError as exc:
+            err_console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(2)
+
+        def explainer(clusters, stats, source):  # noqa: F811
+            payload = build_payload(clusters, stats, source=source, top=explain_top)
+            return run_explain(payload, llm_cfg).overall
+
+    store = Store(state or (":memory:" if demo_stream and not state else default_state_path()))
+    engine = Engine(store, notifiers, cfg, explain=explainer, send=not dry_run)
+
+    if dry_run:
+        where = "nowhere (dry run: alerts are only shown here)"
+    elif notifiers:
+        where = ", ".join(n.label for n in notifiers)
+    else:
+        where = "this screen only (add --notify to send them somewhere)"
+    extras = []
+    if demo_stream and not state:
+        extras.append("Demo mode: memory is not saved between runs.")
+    if explain:
+        extras.append(f"Diagnosis: {provider} / {model or '(no model set)'}")
+    if quiet_window:
+        extras.append(f"Quiet hours: {quiet_hours}")
+    render_watch_header(console, [s.name for s in sources], interval, where, extras)
+
+    watcher = Watcher(engine, sources, interval=window, on_window=lambda r: render_window(console, r, quiet=quiet), on_error=on_error)
+    try:
+        watcher.run(duration=stop_after)
+    except KeyboardInterrupt:
+        watcher.stop.set()
+        console.print("\n[dim]Stopped.[/dim]")
+    finally:
+        store.close()
+
+
+@app.command()
+def history(
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1, help="How many recent alerts to show.")] = 20,
+    state: Annotated[Optional[str], typer.Option("--state", help="Memory file to read (default ~/.strelizia/state.db).")] = None,
+) -> None:
+    """Show recent alerts Strelizia has raised."""
+    path = Path(state) if state else default_state_path()
+    if not path.exists():
+        console.print("[dim]No alert history yet. Start one with `strelizia watch`.[/dim]")
+        return
+    store = Store(path)
+    try:
+        render_history(console, store.recent_alerts(limit))
+    finally:
+        store.close()
 
 
 @app.command()

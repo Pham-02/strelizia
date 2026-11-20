@@ -112,6 +112,72 @@ def _build(lines: list[str], raw_ts: Optional[datetime], source: str) -> LogReco
     )
 
 
+class Assembler:
+    """Incremental version of the assembler, for live streams.
+
+    `feed()` takes one physical line and returns the *previous* record if this line
+    starts a new one (otherwise None). `flush()` returns whatever is still open.
+    """
+
+    def __init__(self, source: str = "", max_lines: int = 200) -> None:
+        self.source = source
+        self.max_lines = max_lines
+        self._cur: list[str] = []
+        self._cur_ts: Optional[datetime] = None
+        self._in_py_traceback = False
+        self._expect_exception_line = False
+
+    @property
+    def pending(self) -> bool:
+        return bool(self._cur)
+
+    def _emit(self) -> Optional[LogRecord]:
+        if not self._cur:
+            return None
+        record = _build(self._cur, self._cur_ts, self.source)
+        self._cur = []
+        self._in_py_traceback = self._expect_exception_line = False
+        return record
+
+    def _start(self, text: str, ts: Optional[datetime]) -> None:
+        self._cur, self._cur_ts = [text], ts
+        self._in_py_traceback = self._expect_exception_line = False
+
+    def feed(self, item: Union[RawLine, str]) -> Optional[LogRecord]:
+        raw = item if isinstance(item, RawLine) else RawLine(str(item))
+        text = raw.text.rstrip("\r\n")
+        if not text.strip():
+            return None
+
+        if _starts_record(text) or not self._cur:
+            done = self._emit()
+            self._start(text, raw.ts)
+            return done
+        if CONTINUATION.match(text):
+            if len(self._cur) < self.max_lines:
+                self._cur.append(text)
+            if text.startswith("Traceback (most recent call last)"):
+                self._in_py_traceback = True
+                self._expect_exception_line = False
+            elif self._in_py_traceback and text[0].isspace():
+                self._expect_exception_line = True
+            else:
+                self._expect_exception_line = False
+            return None
+        if self._in_py_traceback and self._expect_exception_line:
+            # e.g. "KeyboardInterrupt" or "psycopg2.errors.UniqueViolation: ..."
+            if len(self._cur) < self.max_lines:
+                self._cur.append(text)
+            self._in_py_traceback = self._expect_exception_line = False
+            return None
+        done = self._emit()
+        self._start(text, raw.ts)
+        return done
+
+    def flush(self) -> Optional[LogRecord]:
+        return self._emit()
+
+
 def assemble(
     lines: Iterable[Union[RawLine, str]],
     source: str = "",
@@ -122,41 +188,11 @@ def assemble(
     `max_lines` caps how many lines one record may keep, so a runaway trace
     cannot blow up memory.
     """
-    cur: list[str] = []
-    cur_ts: Optional[datetime] = None
-    in_py_traceback = False
-    expect_exception_line = False
-
+    assembler = Assembler(source, max_lines)
     for item in lines:
-        raw = item if isinstance(item, RawLine) else RawLine(str(item))
-        text = raw.text.rstrip("\r\n")
-        if not text.strip():
-            continue
-
-        if _starts_record(text) or not cur:
-            if cur:
-                yield _build(cur, cur_ts, source)
-            cur, cur_ts = [text], raw.ts
-            in_py_traceback = expect_exception_line = False
-        elif CONTINUATION.match(text):
-            if len(cur) < max_lines:
-                cur.append(text)
-            if text.startswith("Traceback (most recent call last)"):
-                in_py_traceback = True
-                expect_exception_line = False
-            elif in_py_traceback and text[0].isspace():
-                expect_exception_line = True
-            else:
-                expect_exception_line = False
-        elif in_py_traceback and expect_exception_line:
-            # e.g. "KeyboardInterrupt" or "psycopg2.errors.UniqueViolation: ..."
-            if len(cur) < max_lines:
-                cur.append(text)
-            in_py_traceback = expect_exception_line = False
-        else:
-            yield _build(cur, cur_ts, source)
-            cur, cur_ts = [text], raw.ts
-            in_py_traceback = expect_exception_line = False
-
-    if cur:
-        yield _build(cur, cur_ts, source)
+        record = assembler.feed(item)
+        if record is not None:
+            yield record
+    record = assembler.flush()
+    if record is not None:
+        yield record
