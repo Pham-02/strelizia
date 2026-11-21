@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/pham-02/strelizia/actions/workflows/ci.yml"><img src="https://github.com/pham-02/strelizia/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/status-v0.3%20early%20development-F97316" alt="Status: v0.3 early development">
+  <img src="https://img.shields.io/badge/status-v0.4%20early%20development-F97316" alt="Status: v0.4 early development">
   <img src="https://img.shields.io/badge/python-3.10%2B-5B3A9E" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-F59E0B" alt="License: MIT">
 </p>
@@ -49,6 +49,8 @@ Big observability platforms (Datadog, Elastic, Grafana Loki) solve this, but the
 3. **Ranks** them by severity and frequency, so the real problem is at the top
 4. **Explains** the top patterns in plain English, if you ask it to (`--explain`), using a local model or a cloud one, with secrets masked first
 5. **Watches** live logs, learns what is normal, and **alerts** you on Discord, Slack, Telegram, ntfy, or any webhook only when something is **new**, **spiking**, or **restarting**, instead of pinging you for every error
+
+It understands **JSON logs, nginx, syslog, and the systemd journal** out of the box and detects the format automatically, so problems group by what actually went wrong (`GET /api/orders returned HTTP 502`) instead of by who happened to hit them.
 
 See the [roadmap](#roadmap) for what is next.
 
@@ -119,9 +121,14 @@ strelizia analyze --docker my-api --since 1h
 # A log file
 strelizia analyze /var/log/nginx/error.log
 
+# The systemd journal (Linux), optionally for one unit
+strelizia analyze --journald --unit nginx --since 2h
+
 # Anything piped in
 docker logs my-api 2>&1 | strelizia analyze -
 ```
+
+The log format (JSON lines, nginx access and error logs, syslog, journald, or plain text) is detected automatically, line by line. Force one with `--format json|nginx|syslog|plain` if you ever need to.
 
 > `--docker` talks to the same Docker daemon that `docker logs` uses, so it works wherever that command works.
 
@@ -168,9 +175,25 @@ strelizia watch /var/log/nginx/error.log --quiet-hours 23:00-07:00 --explain --m
 # Preview alerts on screen without sending them anywhere
 strelizia watch --docker my-api --notify file://alerts.jsonl --dry-run
 
-# Review what it has alerted on
+# Follow the systemd journal, send a summary every morning at 09:00
+strelizia watch --journald --unit nginx --digest-at 09:00
+
+# Review what it has alerted on, or print the digest right now
 strelizia history
+strelizia digest
 ```
+
+### Run it in Docker Compose
+
+A ready-made `docker-compose.yml` runs Strelizia next to your containers. It reaches Docker through a read-only proxy (`tecnativa/docker-socket-proxy`) instead of mounting the Docker socket into Strelizia, because a mounted socket is root-equivalent access to the host even when mounted read-only.
+
+```bash
+echo 'STRELIZIA_NOTIFY=https://discord.com/api/webhooks/...' > .env     # never commit this file
+# edit docker-compose.yml: replace "api" and "worker" with your container names
+docker compose up -d --build
+```
+
+> The Dockerfile and Compose file are built and validated by this project's CI on every push (see the badge), but they have not been tested against a real Docker host by the author. Reports are welcome.
 
 Where alerts can go (pass `--notify URL`, repeatable, or set `STRELIZIA_NOTIFY` to a comma-separated list):
 
@@ -193,7 +216,10 @@ Where alerts can go (pass `--notify URL`, repeatable, or set `STRELIZIA_NOTIFY` 
 |---|---|
 | `FILE` | Log file to read, or `-` for stdin |
 | `-d`, `--docker NAME` | Read from a Docker container instead of a file |
-| `-s`, `--since 1h` | Docker only: how far back to read (`30m`, `1h`, `2d`, `1h30m`) |
+| `--journald` | Read the systemd journal instead (Linux; you may need `sudo` or the `systemd-journal` group) |
+| `-u`, `--unit NAME` | With `--journald`: only this systemd unit, e.g. `nginx` |
+| `-s`, `--since 1h` | Docker and journald: how far back to read (`30m`, `1h`, `2d`, `1h30m`) |
+| `--format auto` | `auto`, `plain`, `json`, `nginx`, or `syslog` |
 | `-n`, `--top 10` | How many patterns to show |
 | `-l`, `--min-level warn` | Ignore records below this level (`debug`, `info`, `warn`, `error`, `fatal`) |
 | `--samples 2` | Sample log entries to show per pattern |
@@ -217,6 +243,8 @@ Where alerts can go (pass `--notify URL`, repeatable, or set `STRELIZIA_NOTIFY` 
 |---|---|
 | `FILES` | Log file(s) to follow (survives rotation and truncation) |
 | `-d`, `--docker NAME` | Container to follow, repeatable (reconnects after restarts) |
+| `--journald`, `-u NAME` | Follow the systemd journal, optionally for one unit |
+| `--format auto` | `auto`, `plain`, `json`, `nginx`, or `syslog` |
 | `--demo spike` | A simulated live log, no server needed |
 | `--interval 60s` | Length of each window |
 | `--notify URL` | Where to send alerts, repeatable (or `STRELIZIA_NOTIFY`) |
@@ -226,6 +254,8 @@ Where alerts can go (pass `--notify URL`, repeatable, or set `STRELIZIA_NOTIFY` 
 | `--min-count 5` | Occurrences needed in a window to count as a spike |
 | `--min-history 10m` | How long to watch before judging spikes |
 | `--quiet-hours 23:00-07:00` | Hold alerts during these hours, send one digest afterwards |
+| `--resolve-after 15m` | Announce "resolved" after a problem has been gone this long (`off` to disable) |
+| `--digest-at 09:00` | Send a daily summary at this local time |
 | `--from-start` | Files: read existing content too, not just new lines |
 | `--alert-samples` | Include one redacted sample line in alerts |
 | `--explain` | Add a model's diagnosis to alerts (with `--provider`, `--model`, `--base-url`) |
@@ -235,6 +265,8 @@ Where alerts can go (pass `--notify URL`, repeatable, or set `STRELIZIA_NOTIFY` 
 | `--state PATH` | Where Strelizia keeps its memory (default `~/.strelizia/state.db`) |
 
 **`strelizia history`**: show recent alerts (`-n` for how many, `--state` to pick the memory file)
+
+**`strelizia digest`**: print a summary of the last day (`--hours` to change it, `--notify URL` to also send it)
 
 ---
 
@@ -253,12 +285,18 @@ Where alerts can go (pass `--notify URL`, repeatable, or set `STRELIZIA_NOTIFY` 
 | Watch mode for Docker containers and files | ✅ Available |
 | "What changed" detection: new patterns, spikes, restarts | ✅ Available |
 | Alerts to Discord, Slack, Telegram, ntfy, webhooks, files | ✅ Available |
-| Dedicated nginx, syslog, and journald adapters | 🔜 v0.4 |
-| Daily digest and Docker Compose setup | 🔜 v0.4 |
+| Format adapters: JSON, nginx, syslog, journald | ✅ Available |
+| "Resolved" notices when a problem ends | ✅ Available |
+| Daily digest | ✅ Available |
+| Docker Compose setup, reproducible benchmarks | ✅ Available |
 
 ### 🧩 Smart log grouping
 
-Uses log template mining (the Drain algorithm via [`drain3`](https://github.com/logpai/Drain3)) to collapse thousands of near-identical lines into a few patterns. Variable parts like IPs, ids, numbers, and timestamps are masked, while meaningful differences are kept: an HTTP `502` and a `404` are never merged, and each severity level is clustered separately.
+Uses log template mining (the Drain algorithm via [`drain3`](https://github.com/logpai/Drain3)) to collapse thousands of near-identical lines into a few patterns. Variable parts like IPs, ids, numbers, and timestamps are masked, while meaningful differences are kept: different HTTP statuses (a `502` and a `504`, let alone a `404`) are never merged, and each severity level is clustered separately.
+
+### 🧬 Understands your log format
+
+An nginx access line is mostly noise: client IP, browser, byte counts. Format adapters know the fields, so they read the real severity (an HTTP 502 is an error, syslog priority 3 is an error), the real timestamp, and build a clean clustering key. A thousand 502s from a thousand visitors become one pattern, `nginx GET /api/orders/<NUM> returned HTTP 502`. JSON logs group by message and error, with the top stack frame included, and the systemd journal is read through its JSON output. Detection is automatic and per line, so a container that writes both access and error logs just works.
 
 ### 📚 Multi-line awareness
 
@@ -273,10 +311,13 @@ Most alerting is noise: every error pings you. Watch mode remembers every patter
 | 🆕 **New** | A pattern it has never seen before (labelled "first seen 3m after the restart at 14:02" when it follows a container restart) |
 | 📈 **Spike** | At least 5× the usual rate and at least 5 occurrences in the window, after 10 minutes of watching. A sustained spike alerts once, and again only if it gets another 5× worse |
 | 🔁 **Still happening** | A pattern that has been active for 15 windows in a row, as a reminder once the cooldown has passed |
+| ✅ **Resolved** | A pattern that raised an alert has not appeared for 15 minutes, or a spike has been back below a fifth of its alert rate (with the default `--spike-factor 5`) for that long. A problem that only happened a handful of times (fewer than 5) is closed silently instead of sending a pair of messages about nothing |
 | ♻️ **Restarted** | A watched container restarted, with the restart count and whether it was killed for running out of memory. A crash loop is summarised once per 10 minutes instead of one ping per restart |
 | 👀 **Already active** | One summary when you first start watching a source that is already broken |
 
-All of these respect `--alert-level` and a per-pattern cooldown (2 hours by default). Everything found in one window goes out as **one message**, not one per pattern. Alerts held back by `--quiet-hours` (or by a failed delivery) arrive afterwards as a single digest.
+All of these respect `--alert-level` and a per-pattern cooldown (2 hours by default). Everything found in one window goes out as **one message**, not one per pattern. Alerts held back by `--quiet-hours` (or by a failed delivery) arrive afterwards as a single message.
+
+With `--digest-at 09:00` you also get a daily summary: what happened in the last 24 hours per source, the busiest patterns, and how many alerts were raised. It is sent even on a quiet day, so it doubles as proof the watcher is alive. (`strelizia digest` prints it on demand.)
 
 Patterns are matched across windows by similarity, not exact text, so a pattern worded slightly differently from one window to the next is not mistaken for a new one.
 
@@ -309,7 +350,7 @@ Run fully offline with [Ollama](https://ollama.com), or use any OpenAI-compatibl
 
 ### 🪶 Lightweight by design
 
-Streaming processing, bounded memory, and a cache that skips the clustering work for repeated identical lines. Current numbers (synthetic logs on a small cloud VM, so treat them as a rough guide): about **30,000 lines per second** on varied logs like nginx access logs, and **250,000+** on repetitive ones like an error flood, using tens of MB of memory.
+Streaming processing, bounded memory, and a cache that skips the clustering work for repeated identical lines. On one cloud-VM core that is roughly **35,000 to 270,000 lines per second** depending on the format and how repetitive the logs are, using a few MB of extra memory. See [Benchmarks](#benchmarks) for the table and how to reproduce it.
 
 ---
 
@@ -317,6 +358,9 @@ Streaming processing, bounded memory, and a cache that skips the clustering work
 
 ```
  Log source (Docker / file / stdin)
+        │
+        ▼
+ Format adapters         JSON · nginx · syslog · journald (auto-detected)  ✅
         │
         ▼
  Multi-line assembler     joins stack traces into single records           ✅
@@ -332,7 +376,7 @@ Streaming processing, bounded memory, and a cache that skips the clustering work
         Memory (SQLite)   Is this pattern new? How common is it usually?   ✅
                 │
                 ▼
-        Rules             new · spike · still happening · restart          ✅
+        Rules             new · spike · still happening · restart · resolved  ✅
                 │         cooldowns, quiet hours, one message per window
                 ▼
         Redactor ──► optional LLM diagnosis ──► Discord / Slack / Telegram /
@@ -345,11 +389,37 @@ Streaming processing, bounded memory, and a cache that skips the clustering work
 
 | Source | Status |
 |---|---|
-| Docker container logs (`--docker`) | ✅ Snapshot of recent logs |
-| Any log file or stdin | ✅ |
-| nginx (access and error) | Works today through file or stdin (auto-detected); dedicated adapter planned for v0.4 |
-| Linux syslog / journald | Works today through file or stdin; journald adapter planned for v0.4 |
-| JSON logs | Planned for v0.4 |
+| Docker containers (`--docker`) | ✅ Snapshot with `analyze`, live with `watch` |
+| Log files and stdin | ✅ Live with `watch` (follows rotation and truncation) |
+| systemd journal (`--journald`) | ✅ Linux with `journalctl` |
+
+| Format | Status |
+|---|---|
+| JSON lines (pino, zap, structlog, logrus, journald, and similar) | ✅ Level, time, message and error fields are read; stack traces stay attached |
+| nginx access and error logs | ✅ Groups by `GET /path returned HTTP 502`; the error log by cause and failing upstream |
+| syslog (RFC 3164 and 5424) | ✅ Severity from the priority field when present |
+| Python and Java stack traces, plain text | ✅ Multi-line records are assembled by heuristics |
+
+Other formats fall back to the plain-text heuristics, which work reasonably but cluster on the whole line. Formats you want supported are a great first contribution (see `formats.py`).
+
+---
+
+## Benchmarks
+
+Reproduce with `python benchmarks/bench.py`. Each case reads a generated log file from disk in its own process, so memory is the analyzer's alone.
+
+*One core of a cloud VM (Intel Xeon @ 2.10GHz), Python 3.12, 300,000 lines per case, best of 2. The logs are synthetic, so treat the numbers as a rough guide and compare runs on the same machine.*
+
+| Case | Lines per second | Extra memory |
+|---|---:|---:|
+| Plain text, an error flood | 209,000 | under 1 MB |
+| Java stack traces | 267,000 | under 1 MB |
+| nginx access + error logs | 85,000 | 5 MB |
+| nginx, adapters off | 37,000 | 6 MB |
+| JSON lines | 95,000 | 1 MB |
+| JSON lines, adapters off | 38,000 | 6 MB |
+
+Two things worth knowing. Format adapters make nginx and JSON logs about **2.3 to 2.5 times faster** (their clustering keys are shorter and repeat more), but add roughly **8 to 10 percent** to plain text, where every line has to be checked first. And repetitive logs (an error flood, which is exactly when you need the tool) are much faster than varied ones, because identical lines skip the clustering work entirely.
 
 ---
 
@@ -376,7 +446,8 @@ Strelizia is honest about what it is:
 
 - Pattern grouping is a heuristic. Unusual log formats may split one problem into a few patterns or merge similar ones.
 - Spike detection needs history: it only judges spikes after `--min-history` (10 minutes by default) of watching, and "usual" means the last 24 hours of what *it* has watched. A brand-new install has no idea what is normal yet.
-- There are no "resolved" notifications yet, and a pattern that stops simply stops being mentioned.
+- "Resolved" means a pattern stopped appearing, or a spike fell well below its alert rate and stayed there. A pattern that merely dropped to a lower but still elevated level is not announced.
+- Format adapters cover the common formats. Anything else falls back to plain-text heuristics, which cluster on the whole line.
 - Diagnoses are **hypotheses**. The real cause of a failure often lives outside the logs (config, a deploy, a full disk), so always check the evidence it shows. Smaller models are noticeably less reliable.
 - Redaction cannot catch every secret (see [Privacy](#privacy)).
 - It does not store or index your logs. It is an analyzer and alerter, not a log management system.
@@ -390,8 +461,8 @@ Strelizia is honest about what it is:
 - [x] **v0.1**: Docker, file and stdin sources, multi-line assembly, Drain3 grouping, `analyze` and `demo` commands
 - [x] **v0.2**: redaction layer, `--dry-run`, LLM diagnosis with structured output (Ollama, OpenAI-compatible, Anthropic), Docker container facts
 - [x] **v0.3**: watch mode, local memory, new / spike / still-happening / restart detection, cooldowns, quiet hours, alerts to Discord, Slack, Telegram, ntfy, webhooks and files
-- [ ] **v0.4**: nginx, syslog and journald adapters, daily digest, "resolved" notifications, Docker Compose setup, benchmarks
-- [ ] **Later**: publish to PyPI, custom rules file, feedback (👍/👎) to improve diagnoses, optional Apprise support for 100+ more services, Kubernetes support
+- [x] **v0.4**: format adapters (JSON, nginx, syslog, journald), "resolved" notices, daily digest, Docker Compose setup, reproducible benchmarks
+- [ ] **Later**: publish to PyPI, custom rules file, feedback (👍/👎) to improve diagnoses, optional Apprise support for 100+ more services, Kubernetes support, more formats (Apache, HAProxy, logfmt)
 
 ---
 
@@ -413,7 +484,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Project layout: `assembler.py` (multi-line records), `clusterer.py` (Drain3 grouping), `sources/` (Docker and file readers), `redact.py` (secret masking), `llm.py` (model providers), `explain.py` (payload, parsing, command safety), `watch.py` (alert rules), `store.py` (memory), `follow.py` (live sources), `notify.py` (alert channels), `report.py` (terminal output), `demo.py` (log generator).
+Project layout: `assembler.py` (multi-line records), `clusterer.py` (Drain3 grouping), `sources/` (Docker, file and journald readers), `formats.py` (JSON, nginx and syslog adapters), `levels.py` (severity guessing), `digest.py` (daily summary), `benchmarks/` (reproducible speed tests), `redact.py` (secret masking), `llm.py` (model providers), `explain.py` (payload, parsing, command safety), `watch.py` (alert rules), `store.py` (memory), `follow.py` (live sources), `notify.py` (alert channels), `report.py` (terminal output), `demo.py` (log generator).
 
 ---
 

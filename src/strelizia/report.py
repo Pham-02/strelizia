@@ -229,7 +229,7 @@ def render_watch_header(console: Console, sources: list[str], interval: str, des
 def render_window(console: Console, result, *, quiet: bool = False) -> None:
     """One line per window, and a panel whenever something deserves attention."""
     stamp = datetime.now().strftime("%H:%M:%S")
-    interesting = bool(result.alerts or result.errors or result.notes or result.delayed)
+    interesting = bool(result.alerts or result.errors or result.notes or result.delayed or result.digest)
     if not quiet:
         line = Text()
         line.append(f"{stamp}  ", style="dim")
@@ -242,7 +242,7 @@ def render_window(console: Console, result, *, quiet: bool = False) -> None:
 
     if result.alerts and result.message:
         worst = result.message.level
-        border = "red" if worst in ("ERROR", "FATAL") else "yellow"
+        border = "red" if worst in ("ERROR", "FATAL") else "yellow" if worst == "WARN" else "green"
         console.print(Panel(Text(result.message.text), title=Text(result.message.title, style="bold"), title_align="left", border_style=border))
         if result.status == "sent":
             console.print(Text("  → sent to " + ", ".join(result.delivered_to), style="green"))
@@ -258,6 +258,8 @@ def render_window(console: Console, result, *, quiet: bool = False) -> None:
 
     if result.delayed:
         console.print(Text(f"  ↪ sent a digest of earlier alerts: {result.delayed.title}", style="green"))
+    if getattr(result, "digest", None):
+        console.print(Panel(Text(result.digest.text), title=Text("📋 " + result.digest.title, style="bold"), title_align="left", border_style="blue"))
     for err in result.errors:
         console.print(Text(f"  ! {err}", style="red"))
     for note in result.notes:

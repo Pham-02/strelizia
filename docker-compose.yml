@@ -1,0 +1,42 @@
+# Strelizia watching other containers and sending alerts.
+#
+#   1. Put your alert destination(s) in a file named .env (never commit it):
+#        STRELIZIA_NOTIFY=https://discord.com/api/webhooks/...
+#   2. Replace "api" and "worker" below with the names of the containers to watch.
+#   3. docker compose up -d --build
+#
+# Strelizia never needs to change anything, so it only gets READ access to Docker through
+# a small proxy that blocks every write. That is safer than mounting the Docker socket
+# straight into Strelizia (a mounted socket is root-equivalent access to the host, even
+# when mounted read-only). To use the socket directly anyway, delete the socket-proxy
+# service, remove DOCKER_HOST, and mount /var/run/docker.sock:/var/run/docker.sock:ro on
+# the strelizia service (you will also need group_add with your docker group id).
+
+services:
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1   # allow reading container info and logs
+      POST: 0         # block everything that changes anything
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [internal]
+
+  strelizia:
+    build: .
+    restart: unless-stopped
+    depends_on: [socket-proxy]
+    env_file: .env
+    environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
+    command: ["watch", "--docker", "api", "--docker", "worker", "--quiet", "--digest-at", "09:00"]
+    volumes:
+      - strelizia-data:/data
+    networks: [internal]
+
+networks:
+  internal:
+
+volumes:
+  strelizia-data:

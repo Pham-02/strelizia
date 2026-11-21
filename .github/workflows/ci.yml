@@ -18,3 +18,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: pytest -q
+
+  docker:
+    # Verifies the Dockerfile and the Compose file on every push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t strelizia .
+      - run: docker run --rm strelizia version
+      - name: Compose file is valid
+        run: |
+          touch .env
+          docker compose config --quiet

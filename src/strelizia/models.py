@@ -43,6 +43,8 @@ class LogRecord:
     source: str = ""
     line_count: int = 1
     ts_text: Optional[str] = field(default=None, repr=False)  # unparsed; see resolve_timestamp
+    key: Optional[str] = field(default=None, repr=False)  # clustering key supplied by a format adapter
+    group: str = field(default="", repr=False)  # never merged with records of another group
 
     def resolve_timestamp(self) -> Optional[datetime]:
         """Parse the timestamp on first use. Most records are filtered out, so this saves work."""
@@ -59,6 +61,8 @@ class LogRecord:
         the parts that identify *what* failed and *where*, so that thousands of
         traces from the same bug collapse together while different bugs do not.
         """
+        if self.key is not None:
+            return self.key
         lines = [ln for ln in self.message.splitlines() if ln.strip()]
         if not lines:
             return ""

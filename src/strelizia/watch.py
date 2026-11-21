@@ -17,6 +17,7 @@ from datetime import datetime, time
 from typing import Callable, Optional
 
 from .clusterer import Clusterer
+from .digest import build_digest
 from .models import Cluster, LogRecord, level_rank
 from .notify import Message, Notifier, NotifyError
 from .pipeline import Stats
@@ -47,6 +48,8 @@ class WatchConfig:
     include_samples: bool = False
     max_listed: int = 6  # patterns listed in one message
     explain_gap: float = 300.0  # seconds between model calls
+    resolve_after: float = 900.0  # quiet (or calmed down) this long before announcing "resolved"; 0 disables
+    digest_at: Optional[time] = None  # local time of the daily digest; None disables
 
 
 @dataclass
@@ -75,7 +78,8 @@ class WindowResult:
     delivered_to: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
-    delayed: Optional[Message] = None  # a digest of earlier undelivered alerts, sent this window
+    delayed: Optional[Message] = None  # earlier undelivered alerts, sent this window
+    digest: Optional[Message] = None  # the daily digest, if it was due this window
 
 
 _LABEL = {
@@ -84,6 +88,7 @@ _LABEL = {
     "STILL": "🔁 Still happening",
     "STARTUP": "👀 Already active",
     "RESTART": "♻️ Restarted",
+    "RESOLVED": "✅ Resolved",
 }
 _NOUN = {
     "NEW": ("new pattern", "new patterns"),
@@ -91,6 +96,7 @@ _NOUN = {
     "STILL": ("ongoing problem", "ongoing problems"),
     "STARTUP": ("pattern already active", "patterns already active"),
     "RESTART": ("restart", "restarts"),
+    "RESOLVED": ("resolved pattern", "resolved patterns"),
 }
 
 
@@ -127,6 +133,7 @@ class Engine:
         self._pending_restarts: dict[str, int] = {}
         self._last_explain: Optional[float] = None
         self._last_prune: Optional[float] = None
+        self._calm: dict[int, float] = {}  # pattern id -> when its spike started calming down
 
     # ------------------------------------------------------------------ main entry
 
@@ -147,6 +154,7 @@ class Engine:
         quiet = self._in_quiet(now)
         if not quiet:
             self._flush_delayed(res)
+        self._maybe_digest(res, now, quiet)
 
         alerts: list[Alert] = []
         if container is not None:
@@ -203,14 +211,24 @@ class Engine:
                     kind = "STILL"
                     note = f"active in each of the last {self._streak[pid]} windows"
                     self._streak[pid] = 0
-            if kind:
+                elif cfg.resolve_after > 0 and last is not None and last.kind == "SPIKE":
+                    calm_note = self._check_calm(pid, last, rate, start, now)
+                    if calm_note:
+                        kind, note = "RESOLVED", calm_note
+            if kind == "RESOLVED":
+                alerts.append(Alert(kind, source, pattern.level, pid, count, rate, usual, pattern.template, note))
+            elif kind:
                 sample = slot["cluster"].samples[0] if cfg.include_samples and slot["cluster"].samples else ""
                 alerts.append(Alert(kind, source, pattern.level, pid, count, rate, usual, pattern.template,
                                     note, sample, slot["cluster"]))
 
         for pid in [p for p in self._streak if p not in folded]:
             del self._streak[pid]
+        for pid in [p for p in self._calm if p not in folded]:
+            del self._calm[pid]
         self.store.record_window(source, start, end, {pid: s["count"] for pid, s in folded.items()})
+        if cfg.resolve_after > 0:
+            self._check_gone(source, folded, now, alerts)
 
         # 4. deliver
         if alerts:
@@ -256,6 +274,52 @@ class Engine:
         what = "restarted" if pending == 1 else f"restarted {pending} times"
         alerts.append(Alert("RESTART", source, "FATAL" if c.oom_killed else "ERROR", None, pending, 0.0, 0.0,
                             f"container {what}, latest start at {_clock(started)}", ", ".join(facts)))
+
+    def _check_calm(self, pid: int, last: AlertRecord, rate: float, start: float, now: float) -> Optional[str]:
+        """A spike counts as resolved once its rate has stayed well below the alert for resolve_after."""
+        if rate > last.rate / self.cfg.spike_factor:
+            self._calm.pop(pid, None)
+            return None
+        began = self._calm.setdefault(pid, start)
+        if now - began >= self.cfg.resolve_after:
+            del self._calm[pid]
+            return f"back down to {rate:.0f}/min (was {last.rate:.0f}/min at the alert)"
+        return None
+
+    def _check_gone(self, source: str, folded: dict, now: float, alerts: list[Alert]) -> None:
+        """Announce patterns that raised an alert and then stopped appearing."""
+        for pattern, last in self.store.open_alerts(source):
+            if pattern.id in folded or now - pattern.last_seen < self.cfg.resolve_after:
+                continue
+            since = self.store.count_since(pattern.id, last.ts)
+            sustained = last.kind in ("SPIKE", "STILL") or last.count + since >= self.cfg.min_count
+            if sustained:
+                note = f"quiet for {_fmt_dur(now - pattern.last_seen)}"
+                alerts.append(Alert("RESOLVED", source, pattern.level, pattern.id, last.count + since, 0.0, 0.0, pattern.template, note))
+            else:  # a one-off: close it quietly instead of sending a pair of messages about nothing
+                self.store.add_alert(ts=now, source=source, pattern_id=pattern.id, kind="RESOLVED", level=pattern.level,
+                                     count=0, rate=0.0, title=f"{source}: closed", body="", status="silent")
+
+    def _maybe_digest(self, res: WindowResult, now: float, quiet: bool) -> None:
+        at = self.cfg.digest_at
+        if at is None:
+            return
+        day = datetime.fromtimestamp(now).date()
+        if now < datetime.combine(day, at).timestamp() or self.store.get_meta("last_digest") == day.isoformat():
+            return
+        self.store.set_meta("last_digest", day.isoformat())
+        if self.store.total_observed(now - 86400, now) < 3600:
+            return  # under an hour of data: nothing useful to say yet, try again tomorrow
+        message = build_digest(self.store, now, 24.0)
+        if quiet:
+            self.store.add_alert(ts=now, source="all", pattern_id=None, kind="DIGEST", level="INFO", count=0, rate=0.0,
+                                 title=message.title, body=message.text, status="held")
+            return
+        status, delivered, errors = self._deliver(message)
+        res.digest, res.errors = message, res.errors + errors
+        self.store.add_alert(ts=now, source="all", pattern_id=None, kind="DIGEST", level="INFO", count=0, rate=0.0,
+                             title=message.title, body=message.text,
+                             status="held" if status == "failed" else status, targets=",".join(delivered))
 
     # ------------------------------------------------------------------ delivery
 
@@ -324,7 +388,7 @@ class Engine:
     def _render(self, alert: Alert, redactor: Redactor) -> list[str]:
         window = _fmt_dur(self.cfg.interval)
         head = f"{_LABEL[alert.kind]} · {alert.level}"
-        if alert.kind == "RESTART":
+        if alert.kind in ("RESTART", "RESOLVED"):
             lines = [head, f"   {redactor.redact(alert.template)}"]
             if alert.note:
                 lines.append(f"   {alert.note}")
@@ -354,7 +418,7 @@ class Engine:
         for a in alerts:
             counts[a.kind] = counts.get(a.kind, 0) + 1
         parts = [f"{n} {_NOUN[k][0 if n == 1 else 1]}" for k, n in counts.items()]
-        worst = max((a.level for a in alerts), key=level_rank)
+        worst = max((a.level for a in alerts if a.kind != "RESOLVED"), key=level_rank, default="INFO")
         structured = [
             {"kind": a.kind, "level": a.level, "count": a.count, "rate_per_min": round(a.rate, 2),
              "usual_per_min": round(a.baseline, 2), "pattern": redactor.redact(a.template), "note": a.note}

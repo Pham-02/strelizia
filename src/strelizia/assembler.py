@@ -13,6 +13,8 @@ from datetime import datetime
 from typing import Iterable, Iterator, Optional, Union
 
 from .models import LogRecord, RawLine
+from .formats import ALL_FORMATS, parse_line
+from .levels import detect_level  # noqa: F401  (re-exported)
 from .util import parse_timestamp  # noqa: F401  (re-exported)
 
 # A line that starts with a timestamp begins a new record.
@@ -34,56 +36,6 @@ CONTINUATION = re.compile(
     r"|[A-Za-z_][\w$.]*(?:Exception|Error|Throwable)(?::|$)"  # exception line of a trace
     r")"
 )
-
-_LEVEL_WORD = re.compile(
-    r"\b(TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|SEVERE|CRITICAL|CRIT|FATAL|PANIC|EMERG|ALERT)\b"
-)
-_NGINX_LEVEL = re.compile(r"\[(emerg|alert|crit|error|warn|notice|info|debug)\]", re.I)
-_HTTP_STATUS = re.compile(r'"\s(\d{3})\s')
-_ERROR_HINT = re.compile(
-    r"\b(traceback|exception|error|failed|failure|refused|timed? ?out|timeout|panic|"
-    r"segfault|fatal|oom|out of memory|killed|denied|unreachable)\b",
-    re.I,
-)
-_WARN_HINT = re.compile(r"\b(warn(?:ing)?|deprecated|retry(?:ing)?|slow)\b", re.I)
-
-_LEVEL_MAP = {
-    "TRACE": "DEBUG", "DEBUG": "DEBUG",
-    "INFO": "INFO", "NOTICE": "INFO",
-    "WARN": "WARN", "WARNING": "WARN",
-    "ERROR": "ERROR", "ERR": "ERROR", "SEVERE": "ERROR",
-    "CRITICAL": "FATAL", "CRIT": "FATAL", "FATAL": "FATAL",
-    "PANIC": "FATAL", "EMERG": "FATAL", "ALERT": "FATAL",
-}
-
-
-def detect_level(message: str) -> str:
-    """Best-effort severity. Always returns one of DEBUG/INFO/WARN/ERROR/FATAL."""
-    first = message.split("\n", 1)[0]
-    head = first[:160]
-
-    m = _LEVEL_WORD.search(head)
-    if m:
-        return _LEVEL_MAP[m.group(1)]
-    m = _NGINX_LEVEL.search(head)
-    if m:
-        return _LEVEL_MAP[m.group(1).upper()]
-    m = _HTTP_STATUS.search(first)
-    if m:
-        status = int(m.group(1))
-        if status >= 500:
-            return "ERROR"
-        if status >= 400:
-            return "WARN"
-        return "INFO"
-    if "Traceback (most recent call last)" in message:
-        return "ERROR"
-    if _ERROR_HINT.search(first):
-        return "ERROR"
-    if _WARN_HINT.search(first):
-        return "WARN"
-    return "INFO"
-
 
 def _starts_record(text: str) -> bool:
     return bool(TS_PREFIX.match(text) or SYSLOG_PREFIX.match(text))
@@ -115,13 +67,15 @@ def _build(lines: list[str], raw_ts: Optional[datetime], source: str) -> LogReco
 class Assembler:
     """Incremental version of the assembler, for live streams.
 
-    `feed()` takes one physical line and returns the *previous* record if this line
-    starts a new one (otherwise None). `flush()` returns whatever is still open.
+    `feed()` takes one physical line and returns the records it completes: usually none,
+    sometimes the previous record, and for a structured line (JSON, nginx, syslog) that
+    line's own record too. `flush()` returns whatever is still open.
     """
 
-    def __init__(self, source: str = "", max_lines: int = 200) -> None:
+    def __init__(self, source: str = "", max_lines: int = 200, formats: frozenset = ALL_FORMATS) -> None:
         self.source = source
         self.max_lines = max_lines
+        self.formats = formats
         self._cur: list[str] = []
         self._cur_ts: Optional[datetime] = None
         self._in_py_traceback = False
@@ -143,16 +97,27 @@ class Assembler:
         self._cur, self._cur_ts = [text], ts
         self._in_py_traceback = self._expect_exception_line = False
 
-    def feed(self, item: Union[RawLine, str]) -> Optional[LogRecord]:
+    def feed(self, item: Union[RawLine, str]) -> tuple[LogRecord, ...]:
         raw = item if isinstance(item, RawLine) else RawLine(str(item))
         text = raw.text.rstrip("\r\n")
         if not text.strip():
-            return None
+            return ()
+
+        if self.formats:
+            parsed = parse_line(text, self.formats)
+            if parsed is not None:  # a structured line is a complete record on its own
+                done = self._emit()
+                ts = parsed.ts or raw.ts
+                record = LogRecord(
+                    message=parsed.message, timestamp=ts, level=parsed.level, source=self.source,
+                    ts_text=None if ts else parsed.ts_text, key=parsed.key, group=parsed.group,
+                )
+                return (done, record) if done else (record,)
 
         if _starts_record(text) or not self._cur:
             done = self._emit()
             self._start(text, raw.ts)
-            return done
+            return (done,) if done else ()
         if CONTINUATION.match(text):
             if len(self._cur) < self.max_lines:
                 self._cur.append(text)
@@ -163,16 +128,16 @@ class Assembler:
                 self._expect_exception_line = True
             else:
                 self._expect_exception_line = False
-            return None
+            return ()
         if self._in_py_traceback and self._expect_exception_line:
             # e.g. "KeyboardInterrupt" or "psycopg2.errors.UniqueViolation: ..."
             if len(self._cur) < self.max_lines:
                 self._cur.append(text)
             self._in_py_traceback = self._expect_exception_line = False
-            return None
+            return ()
         done = self._emit()
         self._start(text, raw.ts)
-        return done
+        return (done,) if done else ()
 
     def flush(self) -> Optional[LogRecord]:
         return self._emit()
@@ -182,17 +147,16 @@ def assemble(
     lines: Iterable[Union[RawLine, str]],
     source: str = "",
     max_lines: int = 200,
+    formats: frozenset = ALL_FORMATS,
 ) -> Iterator[LogRecord]:
     """Group physical lines into logical records.
 
     `max_lines` caps how many lines one record may keep, so a runaway trace
     cannot blow up memory.
     """
-    assembler = Assembler(source, max_lines)
+    assembler = Assembler(source, max_lines, formats)
     for item in lines:
-        record = assembler.feed(item)
-        if record is not None:
-            yield record
+        yield from assembler.feed(item)
     record = assembler.flush()
     if record is not None:
         yield record

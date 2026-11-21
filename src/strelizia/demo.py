@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import threading
 from datetime import datetime, timedelta
@@ -99,7 +100,36 @@ def _bad_deploy(rng: random.Random, start: datetime) -> list[str]:
     return lines
 
 
+def _json_api(rng: random.Random, start: datetime) -> list[str]:
+    """A Node-style JSON-logging API whose payment provider keeps timing out."""
+    lines: list[str] = []
+    t = start
+    for i in range(900):
+        t += timedelta(milliseconds=rng.randint(50, 700))
+        iso = t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
+        roll = rng.random()
+        if i < 200 or roll > 0.5:
+            rec = {"level": "info", "time": iso, "msg": "request completed", "method": "GET",
+                   "path": f"/api/users/{rng.randint(1, 9999)}", "status": 200, "duration_ms": rng.randint(4, 120)}
+        elif roll < 0.36:
+            rec = {"level": "error", "time": iso, "msg": "payment provider timeout", "service": "billing",
+                   "provider": "stripe", "error": f"ETIMEDOUT 10.0.0.9:443 after {rng.randint(2000, 9000)}ms",
+                   "order_id": rng.randint(1000, 9999)}
+        elif roll < 0.42:
+            rec = {"level": "warn", "time": iso, "msg": "retrying request", "attempt": rng.randint(1, 5)}
+        elif roll < 0.45:
+            rec = {"level": "error", "time": iso, "msg": "unhandled exception",
+                   "error": "TypeError: Cannot read properties of undefined (reading 'id')",
+                   "stack": "TypeError: Cannot read properties of undefined (reading 'id')\n"
+                            "    at handler (/app/src/orders.js:88:21)\n    at Layer.handle (/app/node_modules/express/lib/router/layer.js:95:5)"}
+        else:
+            rec = {"level": "info", "time": iso, "msg": "cache hit", "key": f"user:{rng.randint(1, 500)}"}
+        lines.append(json.dumps(rec))
+    return lines
+
+
 SCENARIOS: dict[str, Callable[[random.Random, datetime], list[str]]] = {
+    "json-api": _json_api,
     "db-outage": _db_outage,
     "nginx-502": _nginx_502,
     "bad-deploy": _bad_deploy,

@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS counts (
     PRIMARY KEY (window_id, pattern_id)
 );
 CREATE INDEX IF NOT EXISTS idx_counts_pattern ON counts (pattern_id);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY, ts REAL NOT NULL, source TEXT NOT NULL, pattern_id INTEGER,
     kind TEXT NOT NULL, level TEXT NOT NULL, count INTEGER NOT NULL, rate REAL NOT NULL DEFAULT 0,
@@ -225,10 +226,13 @@ class Store:
         self._db.commit()
         return cur.lastrowid
 
-    def last_alert(self, pattern_id: int) -> Optional[AlertRecord]:
-        """The most recent alert that was actually raised (sent or previewed) for a pattern."""
+    def last_alert(self, pattern_id: int, include_held: bool = False) -> Optional[AlertRecord]:
+        """The most recent alert raised for a pattern. Held alerts were never delivered, so by
+        default they do not count (they must not suppress a later alert); a held alert does
+        still mean an incident was opened, which is what `include_held` is for."""
+        skip = "('dropped')" if include_held else "('held', 'dropped')"
         r = self._db.execute(
-            "SELECT * FROM alerts WHERE pattern_id = ? AND status NOT IN ('held', 'dropped') ORDER BY ts DESC LIMIT 1", (pattern_id,)
+            f"SELECT * FROM alerts WHERE pattern_id = ? AND status NOT IN {skip} ORDER BY ts DESC, id DESC LIMIT 1", (pattern_id,)
         ).fetchone()
         return _alert(r) if r else None
 
@@ -248,8 +252,52 @@ class Store:
         self._db.commit()
 
     def recent_alerts(self, limit: int = 20) -> list[AlertRecord]:
-        rows = self._db.execute("SELECT * FROM alerts ORDER BY ts DESC, id DESC LIMIT ?", (limit,)).fetchall()
+        rows = self._db.execute("SELECT * FROM alerts WHERE status != 'silent' ORDER BY ts DESC, id DESC LIMIT ?", (limit,)).fetchall()
         return [_alert(r) for r in rows]
+
+    def open_alerts(self, source: str) -> list[tuple[Pattern, AlertRecord]]:
+        """Patterns whose latest alert (even one that is still held back) has not been resolved yet."""
+        ids = self._db.execute(
+            "SELECT p.id FROM patterns p WHERE p.source = ? AND ("
+            " SELECT kind FROM alerts WHERE pattern_id = p.id AND status != 'dropped'"
+            " ORDER BY ts DESC, id DESC LIMIT 1) IN ('NEW', 'SPIKE', 'STILL', 'STARTUP')",
+            (source,),
+        ).fetchall()
+        return [(self.get_pattern(r["id"]), self.last_alert(r["id"], include_held=True)) for r in ids]
+
+    def count_since(self, pattern_id: int, since: float) -> int:
+        """Occurrences recorded in windows that ended after `since`."""
+        return int(self._db.execute(
+            "SELECT COALESCE(SUM(c.count), 0) FROM counts c JOIN windows w ON w.id = c.window_id "
+            "WHERE c.pattern_id = ? AND w.end > ?", (pattern_id, since)).fetchone()[0])
+
+    # ------------------------------------------------------------------ digest and meta
+
+    def get_meta(self, key: str) -> Optional[str]:
+        row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._db.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+        self._db.commit()
+
+    def total_observed(self, since: float, until: float) -> float:
+        return float(self._db.execute("SELECT COALESCE(SUM(end - start), 0) FROM windows WHERE end > ? AND start < ?", (since, until)).fetchone()[0])
+
+    def digest_rows(self, since: float, until: float) -> list[tuple[Pattern, int]]:
+        """Warning/error patterns active in the period with their occurrence counts, busiest first."""
+        rows = self._db.execute(
+            "SELECT p.id, SUM(c.count) AS n FROM counts c JOIN windows w ON w.id = c.window_id "
+            "JOIN patterns p ON p.id = c.pattern_id WHERE w.end > ? AND w.start < ? "
+            "AND p.level IN ('WARN', 'ERROR', 'FATAL') GROUP BY p.id ORDER BY n DESC", (since, until)).fetchall()
+        return [(self.get_pattern(r["id"]), int(r["n"])) for r in rows]
+
+    def alert_counts(self, since: float, until: float) -> dict[tuple[str, str], int]:
+        """Alerts actually raised in the period, by (source, kind)."""
+        rows = self._db.execute(
+            "SELECT source, kind, COUNT(*) AS n FROM alerts WHERE ts > ? AND ts <= ? "
+            "AND status IN ('sent', 'console', 'preview') AND kind NOT IN ('DIGEST') GROUP BY source, kind", (since, until)).fetchall()
+        return {(r["source"], r["kind"]): int(r["n"]) for r in rows}
 
     # ------------------------------------------------------------------ housekeeping
 

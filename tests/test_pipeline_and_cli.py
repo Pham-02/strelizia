@@ -23,10 +23,11 @@ def test_db_outage_demo_finds_the_root_cause():
 
 def test_nginx_demo_separates_502_from_404():
     clusters, _ = analyze_lines(generate("nginx-502"))
-    templates = [c.template for c in clusters]
-    assert any(" 502 " in t for t in templates)
-    assert any(" 404 " in t and c.level == "WARN" for t, c in zip(templates, clusters))
-    assert any("connect() failed" in t for t in templates)
+    by_level = {c.level: c.template for c in clusters if "returned HTTP" in c.template}
+    assert by_level["ERROR"].endswith("returned HTTP 502")
+    assert by_level["WARN"].endswith("returned HTTP 404")
+    assert any("connect() failed" in c.template and "upstream=" in c.template for c in clusters)
+    assert not any("Mozilla" in c.template or "<TS>" in c.template for c in clusters)  # access-log noise is gone
 
 
 def test_bad_deploy_demo_separates_exceptions():

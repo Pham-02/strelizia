@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Iterable, Union
 
 from .assembler import assemble
+from .formats import ALL_FORMATS
 from .clusterer import Clusterer
 from .models import Cluster, RawLine, level_rank
 
@@ -25,6 +26,7 @@ def analyze_lines(
     source: str = "",
     min_level: str = "WARN",
     max_samples: int = 2,
+    formats: frozenset = ALL_FORMATS,
 ) -> tuple[list[Cluster], Stats]:
     stats = Stats()
 
@@ -36,7 +38,7 @@ def analyze_lines(
     threshold = level_rank(min_level)
     clusterer = Clusterer(max_samples=max_samples)
     recent: deque[str] = deque(maxlen=2)  # the records just before the current one
-    for record in assemble(counted(), source=source):
+    for record in assemble(counted(), source=source, formats=formats):
         stats.records += 1
         if level_rank(record.level) >= threshold:
             clusterer.add(record, recent)

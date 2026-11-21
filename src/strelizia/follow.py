@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from .assembler import Assembler
+from .formats import ALL_FORMATS
 from .models import LogRecord, RawLine
 from .sources import SourceError
 from .sources.docker import ContainerInfo, _get_container, inspect_container, split_docker_prefix
@@ -133,10 +134,12 @@ class Watcher:
         on_error: Optional[Callable[[str], None]] = None,
         idle_flush: float = 1.0,
         clock: Callable[[], float] = time.time,
+        formats: frozenset = ALL_FORMATS,
     ) -> None:
         self.engine, self.sources, self.interval = engine, sources, interval
         self.on_window, self.on_error = on_window, on_error
         self.idle_flush, self.clock = idle_flush, clock
+        self.formats = formats
         self.stop = threading.Event()
 
     def _inspect(self, source: Source) -> Optional[ContainerInfo]:
@@ -155,7 +158,7 @@ class Watcher:
 
             threading.Thread(target=self._run_reader, args=(source, put), daemon=True).start()
 
-        assemblers = {s.name: Assembler(s.name) for s in self.sources}
+        assemblers = {s.name: Assembler(s.name, formats=self.formats) for s in self.sources}
         records: dict[str, list[LogRecord]] = {s.name: [] for s in self.sources}
         last_line: dict[str, float] = {s.name: 0.0 for s in self.sources}
 
@@ -182,9 +185,7 @@ class Watcher:
                         break
                     continue
                 last_line[name] = t
-                record = assemblers[name].feed(raw)
-                if record is not None:
-                    records[name].append(record)
+                records[name].extend(assemblers[name].feed(raw))
 
             for source in self.sources:
                 a = assemblers[source.name]

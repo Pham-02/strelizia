@@ -1,3 +1,3 @@
 """Strelizia: find the signal in the noise of your server logs."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
